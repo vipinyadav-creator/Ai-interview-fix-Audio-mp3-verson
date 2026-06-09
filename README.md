@@ -22,10 +22,18 @@ Repo → **Settings** → **Secrets and variables** → **Actions** → **New re
 | `GOOGLE_CREDENTIALS_JSON` | Poora `credentials.json` file ka content copy-paste |
 | `GOOGLE_TOKEN_JSON` | Poora `token.json` file ka content copy-paste |
 
-### 3. Google Cloud APIs enable karo
+### 3. Google Cloud APIs enable karo (zaroori)
 
-- Google Drive API
-- Google Sheets API
+Project: `fix-audio-498510`
+
+1. **Google Drive API** – enable karo  
+2. **Google Sheets API** – enable karo (ye step miss hone par workflow fail hota hai):  
+   https://console.cloud.google.com/apis/api/sheets.googleapis.com/overview?project=220553136075  
+   → **Enable** dabao → 2-5 minute wait karo
+
+`token.json` me ye scopes honi chahiye:
+- `https://www.googleapis.com/auth/drive`
+- `https://www.googleapis.com/auth/spreadsheets`
 
 ### 4. Actions enable karo
 

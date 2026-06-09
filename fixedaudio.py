@@ -366,20 +366,32 @@ def check_ffmpeg() -> None:
         sys.exit(1)
 
 
-def ensure_sheets_access(sheets_service) -> None:
+def print_sheets_setup_help(exc: HttpError | None = None) -> None:
+    print("\nGoogle Sheets access nahi mil raha. Ye steps follow karo:")
+    print("1. Google Cloud Console me Google Sheets API enable karo:")
+    print("   https://console.cloud.google.com/apis/api/sheets.googleapis.com/overview?project=220553136075")
+    print("2. 2-5 minute wait karo, phir workflow dubara chalao.")
+    print("3. token.json me spreadsheets scope honi chahiye (local par naya login).")
+    print("4. Spreadsheet usi Google account se share ho jisse login kiya hai.")
+    if exc is not None:
+        print(f"\nError detail: {exc}")
+
+
+def init_sheet_sync(sheets_service) -> tuple[dict[str, int], bool]:
     try:
         sheets_service.spreadsheets().get(
             spreadsheetId=SPREADSHEET_ID,
             fields="properties.title",
         ).execute()
     except HttpError as exc:
-        if exc.resp.status == 403:
-            print("\nGoogle Sheets access nahi mil raha. Ye steps follow karo:")
-            print("1. Google Cloud Console me Google Sheets API enable karo:")
-            print("   https://console.cloud.google.com/apis/library/sheets.googleapis.com")
-            print("2. token.json delete karo aur script dubara chalao (naya permission milega).")
-            print("3. Spreadsheet ko usi Google account se share karo jisse login kiya hai.")
-        raise
+        print_sheets_setup_help(exc)
+        print("\nSheet sync skip ho raha hai. MP3 convert/upload phir bhi chalega.")
+        return {}, False
+
+    print("Spreadsheet se column I links padh rahe hain...")
+    source_to_row = read_sheet_source_rows(sheets_service)
+    print(f"Sheet me {len(source_to_row)} source link(s) mili.")
+    return source_to_row, True
 
 
 def main() -> None:
@@ -387,12 +399,9 @@ def main() -> None:
     creds = get_credentials()
     drive_service = get_drive_service(creds)
     sheets_service = get_sheets_service(creds)
-    ensure_sheets_access(sheets_service)
     processed = load_processed()
 
-    print("Spreadsheet se column I links padh rahe hain...")
-    source_to_row = read_sheet_source_rows(sheets_service)
-    print(f"Sheet me {len(source_to_row)} source link(s) mili.")
+    source_to_row, sheets_ok = init_sheet_sync(sheets_service)
 
     print("Source folder se audio files dhoondh rahe hain...")
     audio_files = list_audio_files(drive_service, SOURCE_FOLDER_ID)
@@ -416,9 +425,13 @@ def main() -> None:
 
         print(f"\nIs run me {converted} nayi file(s) convert/upload hui.")
 
-    print("\nSheet sync: pehle se convert files ke MP3 links col J me likh rahe hain...")
-    synced = sync_existing_to_sheet(sheets_service, source_to_row)
-    print(f"Sheet me {synced} row(s) update hui.")
+    if sheets_ok:
+        print("\nSheet sync: pehle se convert files ke MP3 links col J me likh rahe hain...")
+        synced = sync_existing_to_sheet(sheets_service, source_to_row)
+        print(f"Sheet me {synced} row(s) update hui.")
+    else:
+        print("\nSheet sync skip (Sheets API enable / access fix karo).")
+
     print("Complete.")
 
 
