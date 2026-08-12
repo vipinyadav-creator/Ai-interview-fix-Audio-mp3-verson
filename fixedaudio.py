@@ -2,14 +2,27 @@
 Google Drive audio converter + Google Sheets sync:
 Source folder se audio MP3 me convert karo, destination folder me upload karo,
 aur Spreadsheet ke Interviews sheet me column J me MP3 link likho.
+
+FIX NOTES:
+- Pehle har row ke liye alag write API call hoti thi (skip ke case me bhi,
+  aur phir end me saari links ka dobara full resync) -> 60 writes/min quota
+  turant exceed ho jaati thi (429 RATE_LIMIT_EXCEEDED).
+- Ab sab pending row-updates ek hi batchUpdate() call me jaate hain (chahe
+  100+ rows ho, Sheets API isse ek hi write request count karta hai).
+- synced.json cache rakha hai taaki jo row already sahi value ke saath
+  likhi ja chuki hai use dobara na likha jaaye.
+- Har Google API call ko exponential-backoff retry wrapper me wrap kiya
+  hai taaki koi bhi 429 / temporary 5xx error crash na kare.
 """
 
 import json
 import os
+import random
 import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -37,12 +50,17 @@ CREDENTIALS_FILE = SCRIPT_DIR / "credentials.json"
 TOKEN_FILE = SCRIPT_DIR / "token.json"
 PROCESSED_FILE = SCRIPT_DIR / "processed.json"
 MP3_LINKS_FILE = SCRIPT_DIR / "mp3_links.json"
+SYNCED_FILE = SCRIPT_DIR / "synced.json"   # row -> already sheet me likha hua mp3_id
 
 AUDIO_MIME_PREFIXES = ("audio/",)
 AUDIO_EXTENSIONS = {
     ".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac", ".wma",
     ".webm", ".opus", ".amr", ".3gp", ".mp4", ".mkv",
 }
+
+MAX_RETRIES = 6
+BASE_DELAY = 2  # seconds, exponential backoff ka base
+BATCH_CHUNK_SIZE = 300  # ek batchUpdate call me itni ranges (safe limit)
 
 
 def is_ci() -> bool:
@@ -90,29 +108,39 @@ def get_sheets_service(creds: Credentials):
     return build("sheets", "v4", credentials=creds)
 
 
+# --- Local state helpers ---
+
+def load_json(path: Path, default):
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return default
+
+
 def load_processed() -> set[str]:
-    if PROCESSED_FILE.exists():
-        return set(json.loads(PROCESSED_FILE.read_text(encoding="utf-8")))
-    return set()
+    return set(load_json(PROCESSED_FILE, []))
 
 
 def save_processed(processed: set[str]) -> None:
-    PROCESSED_FILE.write_text(
-        json.dumps(sorted(processed), indent=2),
-        encoding="utf-8",
-    )
+    PROCESSED_FILE.write_text(json.dumps(sorted(processed), indent=2), encoding="utf-8")
 
 
 def load_mp3_links() -> dict[str, str]:
-    if MP3_LINKS_FILE.exists():
-        return json.loads(MP3_LINKS_FILE.read_text(encoding="utf-8"))
-    return {}
+    return load_json(MP3_LINKS_FILE, {})
 
 
 def save_mp3_link(source_id: str, mp3_id: str) -> None:
     links = load_mp3_links()
     links[source_id] = mp3_id
     MP3_LINKS_FILE.write_text(json.dumps(links, indent=2), encoding="utf-8")
+
+
+def load_synced() -> dict[str, str]:
+    """row (string key) -> mp3_id jo already sheet me likha ja chuka hai."""
+    return load_json(SYNCED_FILE, {})
+
+
+def save_synced(synced: dict[str, str]) -> None:
+    SYNCED_FILE.write_text(json.dumps(synced, indent=2), encoding="utf-8")
 
 
 def drive_file_url(file_id: str) -> str:
@@ -142,18 +170,43 @@ def extract_drive_file_id(value: str) -> str | None:
     return None
 
 
+# --- Retry wrapper ---
+
+def with_retry(request_factory, description: str = "API call"):
+    """
+    Google API request ko exponential backoff + jitter ke saath retry karta hai.
+    429 (rate limit) aur 5xx (server) errors par retry karega; baaki errors turant raise honge.
+    request_factory: 0-arg function jo naya request object return kare (retry par fresh call banta hai).
+    """
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            request = request_factory()
+            return request.execute()
+        except HttpError as exc:
+            last_exc = exc
+            status = exc.resp.status if exc.resp is not None else None
+            retryable = status == 429 or (status is not None and 500 <= status < 600)
+            if not retryable or attempt == MAX_RETRIES:
+                raise
+            delay = BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 1)
+            print(f"  {description}: HTTP {status}, retry {attempt}/{MAX_RETRIES} in {delay:.1f}s...")
+            time.sleep(delay)
+    raise last_exc  # pragma: no cover
+
+
+# --- Sheets helpers ---
+
 def read_sheet_source_rows(sheets_service) -> dict[str, int]:
     """Column I se source file id -> row number (1-based) map."""
     range_name = f"{SHEET_NAME}!{SOURCE_COL}:{SOURCE_COL}"
-    result = (
-        sheets_service.spreadsheets()
-        .values()
-        .get(
+    result = with_retry(
+        lambda: sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
             range=range_name,
             valueRenderOption="FORMULA",
-        )
-        .execute()
+        ),
+        description="Read column I",
     )
 
     source_to_row: dict[str, int] = {}
@@ -161,37 +214,46 @@ def read_sheet_source_rows(sheets_service) -> dict[str, int]:
     for idx, row in enumerate(values):
         if not row:
             continue
-        cell = row[0]
-        file_id = extract_drive_file_id(cell)
+        file_id = extract_drive_file_id(row[0])
         if file_id:
             source_to_row[file_id] = idx + 1
     return source_to_row
 
 
-def update_sheet_mp3_link(sheets_service, row: int, mp3_file_id: str) -> None:
-    mp3_url = drive_file_url(mp3_file_id)
-    range_name = f"{SHEET_NAME}!{MP3_COL}{row}"
-    (
-        sheets_service.spreadsheets()
-        .values()
-        .update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=range_name,
-            valueInputOption="USER_ENTERED",
-            body={"values": [[mp3_url]]},
+def batch_update_sheet(sheets_service, updates: dict[int, str]) -> int:
+    """
+    Multiple rows ek hi batchUpdate API call me update karta hai, taaki
+    'Write requests per minute per user' quota par pressure na pade.
+    updates: {row_number: mp3_file_id}
+    """
+    if not updates:
+        return 0
+
+    data = [
+        {
+            "range": f"{SHEET_NAME}!{MP3_COL}{row}",
+            "values": [[drive_file_url(mp3_id)]],
+        }
+        for row, mp3_id in updates.items()
+    ]
+
+    total_updated = 0
+    for i in range(0, len(data), BATCH_CHUNK_SIZE):
+        chunk = data[i:i + BATCH_CHUNK_SIZE]
+        body = {"valueInputOption": "USER_ENTERED", "data": chunk}
+        with_retry(
+            lambda: sheets_service.spreadsheets().values().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body=body,
+            ),
+            description=f"Batch sheet update ({len(chunk)} rows)",
         )
-        .execute()
-    )
-    print(f"  Sheet updated: row {row}, col {MP3_COL}")
+        total_updated += len(chunk)
+        print(f"  Sheet batch updated: {len(chunk)} row(s) (col {MP3_COL})")
+    return total_updated
 
 
-def sync_sheet_for_source(sheets_service, source_to_row: dict[str, int], source_id: str, mp3_id: str) -> None:
-    row = source_to_row.get(source_id)
-    if row:
-        update_sheet_mp3_link(sheets_service, row, mp3_id)
-    else:
-        print(f"  Sheet me row nahi mili (col {SOURCE_COL}): {source_id}")
-
+# --- Drive helpers ---
 
 def is_audio_file(file_meta: dict) -> bool:
     mime = file_meta.get("mimeType", "")
@@ -210,16 +272,15 @@ def list_audio_files(service, folder_id: str) -> list[dict]:
     query = f"'{folder_id}' in parents and trashed = false"
 
     while True:
-        response = (
-            service.files()
-            .list(
+        response = with_retry(
+            lambda: service.files().list(
                 q=query,
                 spaces="drive",
                 fields="nextPageToken, files(id, name, mimeType)",
                 pageToken=page_token,
                 pageSize=100,
-            )
-            .execute()
+            ),
+            description="List Drive files",
         )
         for item in response.get("files", []):
             if is_audio_file(item):
@@ -264,10 +325,9 @@ def upload_mp3(service, local_path: Path, dest_folder_id: str, filename: str) ->
         "parents": [dest_folder_id],
     }
     media = MediaFileUpload(str(local_path), mimetype="audio/mpeg", resumable=True)
-    uploaded = (
-        service.files()
-        .create(body=metadata, media_body=media, fields="id")
-        .execute()
+    uploaded = with_retry(
+        lambda: service.files().create(body=metadata, media_body=media, fields="id"),
+        description=f"Upload {filename}",
     )
     return uploaded["id"]
 
@@ -278,20 +338,20 @@ def mp3_name(original_name: str) -> str:
 
 def process_file(
     drive_service,
-    sheets_service,
-    source_to_row: dict[str, int],
     file_meta: dict,
     processed: set[str],
-) -> bool:
+) -> str | None:
+    """
+    File convert + upload karta hai. Return: naya mp3_id (agar convert hua), warna None.
+    NOTE: Yaha se ab DIRECTLY sheet update nahi hota — sab pending sheet updates
+    main() me collect hoke ek single batch call me jaate hain.
+    """
     file_id = file_meta["id"]
     file_name = file_meta["name"]
 
     if file_id in processed:
-        mp3_links = load_mp3_links()
-        if file_id in mp3_links and file_id in source_to_row:
-            sync_sheet_for_source(sheets_service, source_to_row, file_id, mp3_links[file_id])
         print(f"Skip (already done): {file_name}")
-        return False
+        return None
 
     print(f"Processing: {file_name}")
 
@@ -310,12 +370,10 @@ def process_file(
         mp3_id = upload_mp3(drive_service, output_path, DEST_FOLDER_ID, mp3_name(file_name))
 
     save_mp3_link(file_id, mp3_id)
-    sync_sheet_for_source(sheets_service, source_to_row, file_id, mp3_id)
-
     processed.add(file_id)
     save_processed(processed)
     print(f"Done: {mp3_name(file_name)}")
-    return True
+    return mp3_id
 
 
 def backfill_mp3_links_from_dest(drive_service, audio_files: list[dict]) -> int:
@@ -339,18 +397,6 @@ def backfill_mp3_links_from_dest(drive_service, audio_files: list[dict]) -> int:
     if added:
         MP3_LINKS_FILE.write_text(json.dumps(links, indent=2), encoding="utf-8")
     return added
-
-
-def sync_existing_to_sheet(sheets_service, source_to_row: dict[str, int]) -> int:
-    """Pehle se convert ho chuki files ke liye sheet col J update karo."""
-    mp3_links = load_mp3_links()
-    updated = 0
-    for source_id, mp3_id in mp3_links.items():
-        row = source_to_row.get(source_id)
-        if row:
-            update_sheet_mp3_link(sheets_service, row, mp3_id)
-            updated += 1
-    return updated
 
 
 def check_ffmpeg() -> None:
@@ -379,10 +425,13 @@ def print_sheets_setup_help(exc: HttpError | None = None) -> None:
 
 def init_sheet_sync(sheets_service) -> tuple[dict[str, int], bool]:
     try:
-        sheets_service.spreadsheets().get(
-            spreadsheetId=SPREADSHEET_ID,
-            fields="properties.title",
-        ).execute()
+        with_retry(
+            lambda: sheets_service.spreadsheets().get(
+                spreadsheetId=SPREADSHEET_ID,
+                fields="properties.title",
+            ),
+            description="Check spreadsheet access",
+        )
     except HttpError as exc:
         print_sheets_setup_help(exc)
         print("\nSheet sync skip ho raha hai. MP3 convert/upload phir bhi chalega.")
@@ -400,6 +449,7 @@ def main() -> None:
     drive_service = get_drive_service(creds)
     sheets_service = get_sheets_service(creds)
     processed = load_processed()
+    synced = load_synced()
 
     source_to_row, sheets_ok = init_sheet_sync(sheets_service)
 
@@ -418,17 +468,37 @@ def main() -> None:
         converted = 0
         for file_meta in audio_files:
             try:
-                if process_file(drive_service, sheets_service, source_to_row, file_meta, processed):
+                mp3_id = process_file(drive_service, file_meta, processed)
+                if mp3_id:
                     converted += 1
             except Exception as exc:
                 print(f"Error ({file_meta['name']}): {exc}")
 
         print(f"\nIs run me {converted} nayi file(s) convert/upload hui.")
 
+    # Sab source files ke liye check karo: sheet me row already sahi value
+    # ke saath sync hai ya nahi. Sirf jo naya/change hua hai wahi likhenge,
+    # aur wo bhi ek hi batchUpdate call me (quota-safe).
     if sheets_ok:
-        print("\nSheet sync: pehle se convert files ke MP3 links col J me likh rahe hain...")
-        synced = sync_existing_to_sheet(sheets_service, source_to_row)
-        print(f"Sheet me {synced} row(s) update hui.")
+        mp3_links = load_mp3_links()
+        pending_updates: dict[int, str] = {}
+
+        for source_id, mp3_id in mp3_links.items():
+            row = source_to_row.get(source_id)
+            if not row:
+                continue
+            if synced.get(str(row)) == mp3_id:
+                continue  # already sahi value likhi hui hai, skip
+            pending_updates[row] = mp3_id
+
+        if pending_updates:
+            print(f"\nSheet sync: {len(pending_updates)} row(s) update karni hain (batch me)...")
+            batch_update_sheet(sheets_service, pending_updates)
+            for row, mp3_id in pending_updates.items():
+                synced[str(row)] = mp3_id
+            save_synced(synced)
+        else:
+            print("\nSheet already up-to-date hai, kuch likhne ki zaroorat nahi.")
     else:
         print("\nSheet sync skip (Sheets API enable / access fix karo).")
 
