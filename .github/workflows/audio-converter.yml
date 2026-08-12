@@ -1,33 +1,25 @@
 name: Auto MP3 Converter
-
-on:
+"on":
   schedule:
     # Har 5 minute check (GitHub Actions cron)
     - cron: "*/5 * * * *"
   workflow_dispatch:
-
 permissions:
   contents: write
-
 jobs:
   convert:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Setup Google credentials
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
@@ -35,10 +27,8 @@ jobs:
         run: |
           echo "$GOOGLE_CREDENTIALS_JSON" > credentials.json
           echo "$GOOGLE_TOKEN_JSON" > token.json
-
       - name: Run audio converter
         run: python fixedaudio.py
-
       - name: Save processed state to repo
         run: |
           git config user.name "github-actions[bot]"
