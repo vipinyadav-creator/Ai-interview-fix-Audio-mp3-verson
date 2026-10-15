@@ -1,15 +1,13 @@
 name: Auto MP3 Converter
 
-"on":
+on:
   schedule:
-    # Har 5 minute check
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
 
-# Ek samay par ek hi workflow run
 concurrency:
   group: auto-mp3-converter
   cancel-in-progress: false
@@ -44,14 +42,8 @@ jobs:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
         run: |
-          test -n "$GOOGLE_CREDENTIALS_JSON" || {
-            echo "ERROR: GOOGLE_CREDENTIALS_JSON secret is missing"
-            exit 1
-          }
-          test -n "$GOOGLE_TOKEN_JSON" || {
-            echo "ERROR: GOOGLE_TOKEN_JSON secret is missing"
-            exit 1
-          }
+          test -n "$GOOGLE_CREDENTIALS_JSON"
+          test -n "$GOOGLE_TOKEN_JSON"
           printf '%s' "$GOOGLE_CREDENTIALS_JSON" > credentials.json
           printf '%s' "$GOOGLE_TOKEN_JSON" > token.json
 
@@ -85,10 +77,9 @@ jobs:
             git rebase --abort || true
 
             if [ "$attempt" -lt 3 ]; then
-              echo "Push failed; retrying ($attempt/3)..."
               sleep 2
             fi
           done
 
-          echo "ERROR: Could not push processed state after 3 attempts."
+          echo "ERROR: Could not push processed state."
           exit 1
