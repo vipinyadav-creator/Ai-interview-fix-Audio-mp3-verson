@@ -42,6 +42,7 @@ jobs:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
         run: |
+          umask 077
           test -n "$GOOGLE_CREDENTIALS_JSON"
           test -n "$GOOGLE_TOKEN_JSON"
           printf '%s' "$GOOGLE_CREDENTIALS_JSON" > credentials.json
@@ -55,7 +56,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add processed.json mp3_links.json
+          git add processed.json mp3_links.json synced.json
 
           if git diff --cached --quiet; then
             echo "No state changes to commit."
