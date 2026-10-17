@@ -72,8 +72,12 @@ def write_secret_files_from_env() -> None:
     token_json = os.environ.get("GOOGLE_TOKEN_JSON")
     if creds_json and not CREDENTIALS_FILE.exists():
         CREDENTIALS_FILE.write_text(creds_json, encoding="utf-8")
+        if os.name == "posix":
+            os.chmod(CREDENTIALS_FILE, 0o600)
     if token_json and not TOKEN_FILE.exists():
         TOKEN_FILE.write_text(token_json, encoding="utf-8")
+        if os.name == "posix":
+            os.chmod(TOKEN_FILE, 0o600)
 
 
 def get_credentials() -> Credentials:
@@ -96,6 +100,8 @@ def get_credentials() -> Credentials:
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
             creds = flow.run_local_server(port=0)
         TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+        if os.name == "posix":
+            os.chmod(TOKEN_FILE, 0o600)
 
     return creds
 
